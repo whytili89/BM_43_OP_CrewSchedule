@@ -1,0 +1,515 @@
+/*
+ Title: BM_RecommendedFT_AfternCRew_Batch
+ 설명: #43 - 권장 MH에 따른 풀타임 OP 크루 배치
+ @author: brighant - 최용현
+ 작성 날짜: 2022-06-16
+ 마지막으로 수정한 날짜: 2022-06-22
+ */
+global without sharing class BM_43_OP_CrewSchedule implements Database.Batchable<sObject>, Database.Stateful{
+    global Boolean crewScheduleChk = true;
+    global Date startDate;
+    global Date endDate;
+    global Database.QueryLocator start(Database.BatchableContext dbc){
+
+       
+        /**
+         * 전체 FC관리 조회(LIST)
+         * 테스트시에는 '강남대치점','강남삼성점','마포홍대점' 만 해서 조회되도록 함
+        */
+        //String queryFields = 'Id, BM_FC_CL__c, CreatedById, Name, BM_FC_Address__c, BM_FC_Manager__c, LastModifiedById, OwnerId, LastDataProcessedDate__c, BM_FC_New__c, BM_FC_OpenDate__c, ExtraMH_Percentage__c, BM_FC_Phone__c, BM_SupportMH__c, BM_FC_TotalEmployees__c, BM_FC_CloseDate__c';   //, BM_FC_SupportCrew__c
+        String queryFields = 'Id, Name ';   //, BM_FC_SupportCrew__c
+        String queryObjectAPIName = 'BM_FC_Mgmt__c ';
+        String query = 'SELECT ' + queryFields + 'FROM ' + queryObjectAPIName;
+        
+        Set<String> queryWhere = new Set<String>{ '강남대치점', '강남삼성점', '마포홍대점' };
+        //Set<String> queryWhere = new Set<String>{ '강남대치점' };
+        query += 'WHERE Name IN :queryWhere ';
+
+        return Database.getQueryLocator(query);
+    }
+
+    global void execute(Database.BatchableContext dbc, List<BM_FC_Mgmt__c> colBFM){
+        
+
+        //최초로 기간내 크루스케쥴이 존재 하는지 확인하기 위하여 조회(기간내에 스케쥴을 넣을때 이미 기간안에 스케쥴이 있으면 삭제하고 진행하므로)
+        // List<BM_CrewSchedule__c> crewScheduleChkList = [SELECT Id, BM_CS_CheckIn__c, BM_CS_Date__c, BM_CS_Crew__c, BM_CS_Day__c, BM_CS_CrewType__c, BM_CS_Holiday__c 
+        //                                                 FROM BM_CrewSchedule__c 
+        //                                                 WHERE BM_CS_Date__c >= :startDate AND BM_CS_Date__c <= :endDate AND BM_CS_CheckIn__c != null] ;
+
+        // if (!(crewScheduleChkList.size() > 0 && crewScheduleChkList != null)){                                       
+            //FC관리 Loop
+            for (BM_FC_Mgmt__c bfm : colBFM){
+   
+                String curFcID = bfm.Id;   //FC관리 ID
+
+                //각지점에 속해있는 크루 조회(List)
+                List<BM_CrewMgmt__c> crewMgmtList = [SELECT Id, BM_FC_Name__c, BM_WorkType__c, Name 
+                                                    FROM BM_CrewMgmt__c 
+                                                    WHERE BM_FC_Name__c = :curFcID AND BM_WorkType__c IN ('일반 풀타임(40)','주말 풀타임(16)')];
+
+                if (crewMgmtList.size() > 0 && crewMgmtList != null){
+                    
+                    crewMgmtList = randomize(crewMgmtList); //조회된 크루관리 List 랜덤으로 1차 재배치
+
+                    //1차 랜덤 재배치된 크루관리 리스트에서 첫번째 데이터가 주말 풀타임일 경우 첫번째 데이터가 주말 풀타임이 아닐때까지 List 랜덤 재배치
+                    while(crewMgmtList[0].BM_WorkType__c == '주말 풀타임(16)'){
+                        crewMgmtList = randomize(crewMgmtList); //list 랜덤 재배치
+                    }
+
+
+                    List<Map<String, Object>> crewMgmtMapList = new List<Map<String, Object>>();
+                    
+                    //Map List에 추가정보를 담기위해 지점의 크루에 대해 Loop
+                    Integer varTotalAllCrewBatchCount = 0;  //총 크루의 배치해야하는 스케줄 개수
+                    Integer varTotalSetCrewBatchCount = 0;  //배치가 완료된 크루의 스케줄 개수
+                    
+                    Set<Id> crewIds = new Set<Id>();    //조회된 전체 크루id 셋팅
+                    
+                    for (BM_CrewMgmt__c crewMgmt : crewMgmtList) {
+                        //String curCrewID = bfm.Id;   //크루 관리 ID
+                        Map<String, Object> crewMgmtMap = new Map<String, Object>();
+                        
+                        crewMgmtMap.put('Id', crewMgmt.Id);
+                        crewMgmtMap.put('BM_FC_Name__c', crewMgmt.BM_FC_Name__c);
+                        crewMgmtMap.put('BM_WorkType__c', crewMgmt.BM_WorkType__c);
+                        crewMgmtMap.put('Name', crewMgmt.Name);
+                        if(crewMgmt.BM_WorkType__c == '일반 풀타임(40)'){
+                            crewMgmtMap.put('tot_batchCount', 5);   //일반풀타임에 5 셋팅
+                            varTotalAllCrewBatchCount = varTotalAllCrewBatchCount+5;
+                        }else{
+                            crewMgmtMap.put('tot_batchCount', 2);   //주말풀타임에 2 셋팅
+                            varTotalAllCrewBatchCount = varTotalAllCrewBatchCount+2;
+                        }
+                        crewMgmtMap.put('block', '');   //해당 블록 셋팅
+                        
+                        crewIds.add(crewMgmt.Id);
+                        crewMgmtMapList.add(crewMgmtMap);
+                    }
+
+                    //system.debug('crewIds::'+crewIds);
+
+
+
+                    //해당 크루들의 시작일-1 ~ 종료일-1 의 기간동안 CL 스케쥴 조회
+                    Date varStartDateMinus1 =  startDate.addDays(-1);
+                    Date varEndDateMinus1 =  endDate.addDays(-1);
+                    Time varTimeLess15 = time.newInstance(15, 00, 00, 00);
+
+                    List<BM_CrewSchedule__c> crewScheduleCLChkList = [SELECT Id, BM_CS_CheckIn__c, BM_CS_Date__c, BM_CS_Crew__c, BM_CS_Day__c, BM_CS_CrewType__c, BM_CS_Holiday__c, BM_CS_Crew__r.RetiredStatus__c 
+                                                                FROM BM_CrewSchedule__c 
+                                                                WHERE BM_CS_Crew__c IN :crewIds AND BM_CS_Crew__r.RetiredStatus__c = '재직중' AND BM_CS_Date__c >= :varStartDateMinus1 AND BM_CS_Date__c <= :varEndDateMinus1 AND BM_CS_CheckIn__c = :varTimeLess15];
+
+
+
+
+
+                    //우선 전체 기간내(시작일~종료일) 권장인원을 확인하기 위해 일자별생산성 관리를 조회
+                    List<BM_DailyProductivityManagement__c> dailyProductivityManagementList = [SELECT Id, BM_DPM_Date__c, Weekday__c, OP_ScheduledCrews__c, BM_DPM_OP_RcmndedNumbOfPpl__c, OP_ExtraFT__c 
+                                                FROM BM_DailyProductivityManagement__c 
+                                                WHERE BM_DPM_FC__c = :curFcID AND BM_DPM_Date__c >= :startDate AND BM_DPM_Date__c <= :endDate ORDER BY BM_DPM_Date__c ASC];
+                    
+
+                    //매치여부를 따지기 위해 새로운 Map List에 일자별생산성 관리 리스트 셋팅
+                    List<Map<String, Object>> mapListDPM = new List<Map<String, Object>>();
+                    
+                    Integer varTotalOpRecommendedCrew = 0;  //전체 날짜의 총 권장인원
+                    for (BM_DailyProductivityManagement__c dpml : dailyProductivityManagementList) {
+                        Integer varOpRecommendedCrew =(dpml.OP_ExtraFT__c == null?0:Integer.valueOf(Math.floor(dpml.OP_ExtraFT__c))) + Integer.valueOf(Math.floor(dpml.BM_DPM_OP_RcmndedNumbOfPpl__c));
+                        varTotalOpRecommendedCrew = varTotalOpRecommendedCrew + varOpRecommendedCrew;
+                        
+                        Map<String, Object> mldpmMap = new Map<String, Object>();
+
+                        mldpmMap.put('Id', dpml.Id);
+                        mldpmMap.put('remainCount', varOpRecommendedCrew);
+    
+                        mapListDPM.add(mldpmMap);
+                    
+                    }
+
+                
+                    Boolean loopResult = true;
+                    Integer testWhileIndex = 0;
+
+
+                    List<BM_CrewSchedule__c> newCrewSchList = new List<BM_CrewSchedule__c>();   //크루스케줄 insert용
+                    //List<BM_CrewMgmt__c> crewListToUpdate = new List<BM_CrewMgmt__c>();        //크루관리 update용
+
+
+                    //varTotalAllCrewBatchCount = (dailyProductivityManagementList.size() / 7)
+                    Integer totalBlockCount = Integer.valueof(Math.ceil(dailyProductivityManagementList.size() / 7));
+
+                    while(loopResult){
+                        testWhileIndex++;
+                        Integer dpmlIndex = 0;
+                        //system.debug('TEST_AAA:::'+dpmlIndex);
+                        for (BM_DailyProductivityManagement__c dpml : dailyProductivityManagementList) {
+                            Map<String, Object> mapListDpmMap = mapListDPM.get(dpmlIndex);
+
+                            Integer remainCount =  Integer.valueOf(mapListDpmMap.get('remainCount')); //해당 날짜에 총권장인원에서 배치되고 남은 인원수
+
+                            //system.debug('remainCount:::'+remainCount);
+                            
+                            dpmlIndex++;
+                            
+
+                            Integer blockCount = 0;
+                            for (Integer i = 0; i < (totalBlockCount+1); i++) {
+                                if(dpmlIndex <= ((i+1)*7)){
+                                    blockCount = i+1;
+                                    break;
+                                }
+                            }
+
+                            
+                            
+                            if(remainCount <= 0){
+                                continue; //총권장인원에서 남은 배치된 스케줄 인원 을 비교해서 남지 않으면 다음 날짜로
+                            }else{
+                                String settingCurCrewID = '';
+
+                                
+                                for (Integer i = 0; i < crewMgmtMapList.size(); i++){
+                                    Map<String, Object> crewMgmtInfo = crewMgmtMapList.get(i);
+                                    
+                                    // if(testWhileIndex == 1 && i == 0){
+                                    //     settingCurCrewID = String.valueOf(crewMgmtInfo.get('Id'));
+                                    // }
+                                    
+                                    String curCrewID = String.valueOf(crewMgmtInfo.get('Id'));   //크루 관리 ID
+                                    String curCrewName = String.valueOf(crewMgmtInfo.get('Name'));   //크루 관리 Name
+                                    String curFcName = String.valueOf(crewMgmtInfo.get('BM_FC_Name__c'));   //크루 관리 BM_FC_Name__c
+                                    String curWorkType = String.valueOf(crewMgmtInfo.get('BM_WorkType__c'));   //크루 관리 BM_WorkType__c
+                                    Integer totBatchCount =  Integer.valueOf(crewMgmtInfo.get('tot_batchCount'));
+                                    
+                                    BM_CrewSchedule__c newCrewSch = new BM_CrewSchedule__c();
+                                    BM_CrewMgmt__c crewToUpdate = new BM_CrewMgmt__c();
+
+
+
+                                    if(totBatchCount > 0){
+
+                                        if(newCrewSchList.size() > 0 && newCrewSchList != null){
+                                            Integer dateCount = 0;
+                                            Boolean todayCrewScresult = false;
+                                            for (BM_CrewSchedule__c ncsl : newCrewSchList) {
+                                                //system.debug('testBM_CS_Crew__c:'+ncsl.BM_CS_Crew__c+'//dpml.testBM_DPM_Date__c'+dpml.BM_DPM_Date__c+'//ncsl.testBM_CS_Date__c'+ncsl.BM_CS_Date__c );
+
+                                                if(ncsl.BM_CS_Crew__c == curCrewID){
+                                                    if(dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c.addDays(-1) 
+                                                    || dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c.addDays(-2) 
+                                                    || dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c.addDays(-3)
+                                                    || dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c.addDays(-4)
+                                                    || dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c.addDays(-5)
+                                                    ){
+                                                        dateCount++;
+                                                    }
+
+                                                    if(dpml.BM_DPM_Date__c == ncsl.BM_CS_Date__c ){
+                                                        todayCrewScresult = true;
+                                                    }
+                                                }else{
+                                                    continue;
+                                                }
+
+                                                
+                                            }
+                                            //system.debug('testtodayCrewScresult'+todayCrewScresult+'//dateCount'+dateCount);
+
+                                            //해당날짜에 스케쥴 존재시 다음으로
+                                            if(todayCrewScresult){
+                                                continue;
+                                            }
+
+                                            //해당 스케쥴 날짜에서 이전 연달아 5일일경우 다음날짜로
+                                            if(dateCount == 5){
+                                                break;
+                                            }
+                                        }
+                                        
+
+                                        if(String.valueOf(crewMgmtInfo.get('block')).indexOf(String.valueOf(blockCount)) > -1){
+                                            continue;
+                                        }
+
+                                        //전날 CL 스케쥴이 존재하면 다음 날짜로
+                                        if(crewScheduleCLChkList.size() > 0 && crewScheduleCLChkList != null){
+                                            Integer cscclTotCunt = 0;
+                                            for (BM_CrewSchedule__c csccl : crewScheduleCLChkList) {
+                                                if(csccl.Id == curCrewID && dpml.BM_DPM_Date__c.addDays(-1) == csccl.BM_CS_Date__c){
+                                                    cscclTotCunt++;
+                                                }
+                                            }
+                                            if(cscclTotCunt > 0){
+                                                break;
+                                            }
+                                        }
+                                        
+
+                                        //system.debug('settingCurCrewID::'+settingCurCrewID+'///curCrewID:'+curCrewID+'/'+curCrewName);
+                                        if(dpml.Weekday__c == '토' || dpml.Weekday__c == '일'){
+
+                                            newCrewSch.BM_CS_Crew__c = curCrewID;
+                                            newCrewSch.BM_CS_Date__c = dpml.BM_DPM_Date__c;
+                                            newCrewSch.BM_CS_CheckIn__c = Time.newInstance(06, 00, 00, 00);
+                                            newCrewSch.BM_CSType_6__C = '입고';
+                                            newCrewSch.BM_CSType_7__C = '입고';
+                                            newCrewSch.BM_CSType_8__C = '입고';
+                                            newCrewSch.BM_CSType_9__C = '피패킹';
+                                            newCrewSch.BM_CSType_10__C = '피패킹';
+                                            newCrewSch.BM_CSType_11__C = '피패킹';
+                                            newCrewSch.BM_CSType_12__C = '피패킹';
+                                            newCrewSch.BM_CSType_13__C = '피패킹';
+                                            newCrewSch.BM_CSType_14__C = '피패킹';
+                                            newCrewSchList.add(newCrewSch);
+                                            
+                                            
+
+                                            //crewToUpdate.Id = curCrewID;
+                                            //crewToUpdate.LastCreatedScheduleDate__c = dpml.BM_DPM_Date__c;
+                                            //crewToUpdate.LastCreatedScheduleTime__c = Time.newInstance(06, 00, 00, 00);
+                                            //crewListToUpdate.add(crewToUpdate);
+                                            
+                                            
+                                            crewMgmtInfo.put('tot_batchCount', totBatchCount - 1);
+                                            
+                                            if(Integer.valueOf(crewMgmtInfo.get('tot_batchCount')) == 0){
+                                                String allBlockCount = String.valueOf(crewMgmtInfo.get('block')) + ',' + String.valueOf(blockCount)+',';
+                                                crewMgmtInfo.put('block', allBlockCount);
+                                            }
+                                            
+
+                                            mapListDpmMap.put('remainCount', remainCount - 1);
+                                            varTotalSetCrewBatchCount++;
+                                            //varTotalAllCrewBatchCount--;
+                                            system.debug('AA///BM_DPM_Date__c: '+dpml.BM_DPM_Date__c+'///Weekday__c: '+dpml.Weekday__c+'///curCrewName: '+curCrewName+'('+curWorkType+')'+'///remainCount:'+remainCount+'///totBatchCount'+totBatchCount+totBatchCount+'//block'+String.valueOf(crewMgmtInfo.get('block')));
+                                            break;
+                                        }else{
+                                            if(curWorkType != '주말 풀타임(16)'){
+                                                
+                                
+                                                newCrewSch.BM_CS_Crew__c = curCrewID;
+                                                newCrewSch.BM_CS_Date__c = dpml.BM_DPM_Date__c;
+                                                newCrewSch.BM_CS_CheckIn__c = Time.newInstance(06, 00, 00, 00);
+                                                newCrewSch.BM_CSType_6__C = '입고';
+                                                newCrewSch.BM_CSType_7__C = '입고';
+                                                newCrewSch.BM_CSType_8__C = '입고';
+                                                newCrewSch.BM_CSType_9__C = '피패킹';
+                                                newCrewSch.BM_CSType_10__C = '피패킹';
+                                                newCrewSch.BM_CSType_11__C = '피패킹';
+                                                newCrewSch.BM_CSType_12__C = '피패킹';
+                                                newCrewSch.BM_CSType_13__C = '피패킹';
+                                                newCrewSch.BM_CSType_14__C = '피패킹';
+                                                newCrewSchList.add(newCrewSch);
+                                                
+
+                                                //crewToUpdate.Id = curCrewID;
+                                                //crewToUpdate.LastCreatedScheduleDate__c = dpml.BM_DPM_Date__c;
+                                                //crewToUpdate.LastCreatedScheduleTime__c = Time.newInstance(06, 00, 00, 00);
+                                                //crewListToUpdate.add(crewToUpdate);
+                                            
+                                                
+                                                crewMgmtInfo.put('tot_batchCount', totBatchCount - 1);
+                                                //crewMgmtInfo.put('block', blockCount);
+                                                if(Integer.valueOf(crewMgmtInfo.get('tot_batchCount')) == 0){
+                                                    String allBlockCount = String.valueOf(crewMgmtInfo.get('block')) + ',' + String.valueOf(blockCount)+',';
+                                                    crewMgmtInfo.put('block', allBlockCount);
+                                                }
+                                                mapListDpmMap.put('remainCount', remainCount - 1);
+                                                varTotalSetCrewBatchCount++;
+                                                
+                                                //varTotalAllCrewBatchCount--;
+                                                system.debug('BB///BM_DPM_Date__c: '+dpml.BM_DPM_Date__c+'///Weekday__c: '+dpml.Weekday__c+'///curCrewName: '+curCrewName+'('+curWorkType+')'+'///remainCount:'+remainCount+'///totBatchCount'+totBatchCount+totBatchCount+'//block'+String.valueOf(crewMgmtInfo.get('block')));
+                                                break;
+    
+                                            }else{
+                                                continue;   //평일인데 주말풀타임 올 경우 다음크루로 통과
+                                            }
+                                        }
+                                        
+                                        
+                                    }else{
+                                        //settingCurCrewID = curCrewID;
+                                        continue;   //배치카운트가 0이면 다음크루로 통과
+                                    }
+                                    
+                                    
+                                }
+
+
+                                Integer allTotBatchCount = 0;
+                                for (Integer i = 0; i < crewMgmtMapList.size(); i++){
+                                    Map<String, Object> crewMgmtInfo = crewMgmtMapList.get(i);
+                                    allTotBatchCount = allTotBatchCount+Integer.valueOf(crewMgmtInfo.get('tot_batchCount'));
+                                }
+                                
+                                if(allTotBatchCount == 0){
+                                    for (Integer i = 0; i < crewMgmtMapList.size(); i++){
+                                        Map<String, Object> crewMgmtInfo = crewMgmtMapList.get(i);
+
+                                        if(crewMgmtInfo.get('BM_WorkType__c') == '일반 풀타임(40)'){
+                                            crewMgmtInfo.put('tot_batchCount', 5);   //일반풀타임에 5 셋팅
+                                        }else{
+                                            crewMgmtInfo.put('tot_batchCount', 2);   //주말풀타임에 2 셋팅
+                                        }
+
+                                    }
+                                }
+
+                            }
+                        }
+
+                        //system.debug('varTotalAllCrewBatchCount::'+varTotalAllCrewBatchCount);
+                        //system.debug('varTotalOpRecommendedCrew::'+varTotalOpRecommendedCrew);
+                        //system.debug('varTotalSetCrewBatchCount::'+varTotalSetCrewBatchCount);
+                        if(varTotalOpRecommendedCrew <= newCrewSchList.size()){
+                            loopResult = false;
+                        }
+                        // if(varTotalAllCrewBatchCount > varTotalSetCrewBatchCount){
+                        //     if(varTotalOpRecommendedCrew <= varTotalSetCrewBatchCount){
+                        //         loopResult = false;
+                        //     }else{
+                        //         loopResult = true;
+                        //     }
+                        // }else{
+                        //     loopResult = false;
+                        // }
+
+                    }
+
+                    //크루스케쥴 insert
+                    if(newCrewSchList.size()>0 && newCrewSchList!= null){
+                        insert newCrewSchList;
+                    }
+                    
+
+                    
+
+
+                    //시간대별 생산성관리 리스트 조회
+                    List<BM_HourlyProductivityManagement__c> hourlyProductivityManagementList = [SELECT Id, BM_HO_ProductivityManagement__c,  BM_HO_Slot__c, OP_ScheduledFullTimeMH__c, BM_HPM_Date__c, BM_HO_ProductivityManagement__r.BM_DPM_FC__c, TotalScheduledFullTimeMH__c  
+                                                                    FROM BM_HourlyProductivityManagement__c 
+                                                                    WHERE BM_HO_Slot__c >= 6 AND BM_HO_Slot__c <= 14
+                                                                    AND BM_HO_ProductivityManagement__r.BM_DPM_FC__c = :curFcID
+                                                                    AND BM_HPM_Date__c >= :startDate AND BM_HPM_Date__c <= :endDate
+                                                                    ORDER BY BM_HPM_Date__c, BM_HO_Slot__c ASC];
+
+
+                    //시간대별 생산성관리 업데이트용
+                    List<BM_HourlyProductivityManagement__c> hpmlListToUpdate = new List<BM_HourlyProductivityManagement__c>();
+                    
+                    for (BM_HourlyProductivityManagement__c hpml : hourlyProductivityManagementList) {
+                        Integer varSumOpScheduledFullTimeMH = 0;
+
+                        
+                        for (BM_CrewSchedule__c ncsl : newCrewSchList) {
+                            if(ncsl.BM_CS_Date__c == hpml.BM_HPM_Date__c){                         
+                                varSumOpScheduledFullTimeMH++;  //같은 날짜에 6~14시끼지는 스케쥴에 배치된 크루만큼 증가
+                            }else{
+                                continue;
+                            }
+                        }
+
+                        BM_HourlyProductivityManagement__c hpmlToUpdate = new BM_HourlyProductivityManagement__c();
+
+                        Integer varOpScheduledFullTimeMH = 0;
+                        if(hpml.OP_ScheduledFullTimeMH__c == null){
+                            varOpScheduledFullTimeMH = 0;
+                        }else{
+                            varOpScheduledFullTimeMH = Integer.valueOf(hpml.OP_ScheduledFullTimeMH__c);
+                        }
+
+                        hpmlToUpdate.Id = hpml.Id;
+                        
+                        //hpmlToUpdate.BM_HPM_Date__c = hpml.BM_HPM_Date__c;
+                        //hpmlToUpdate.BM_HO_Slot__c = hpml.BM_HO_Slot__c;
+
+                        hpmlToUpdate.OP_ScheduledFullTimeMH__c = varOpScheduledFullTimeMH + varSumOpScheduledFullTimeMH;
+                        hpmlListToUpdate.add(hpmlToUpdate);
+
+                    }
+
+                        
+                        //시간대별생산성관리 OP_ScheduledFullTimeMH__c 업데이트
+                        if(hpmlListToUpdate.size()>0 && hpmlListToUpdate!= null){
+                            update hpmlListToUpdate;
+                        }
+                        
+
+
+                    // system.debug('newCrewSchList::'+newCrewSchList.size());
+                    // system.debug('hpmlListToUpdate::'+hpmlListToUpdate.size());
+
+                    // for (BM_HourlyProductivityManagement__c bbb : hpmlListToUpdate) {
+                    //     system.debug('testId::'+bbb.Id+'///testOP_ScheduledFullTimeMH__c:'+bbb.OP_ScheduledFullTimeMH__c+'///BM_HO_Slot__c'+bbb.BM_HO_Slot__c) ;
+                    // }
+
+                
+                }
+            }
+    //    }else{
+    //         crewScheduleChk = false;
+    //    }
+        
+        
+        
+        
+        
+        
+        
+    }
+
+    //크루관리 리스트의 배열 랜덤으로 재배치
+    private list<BM_CrewMgmt__c> randomize(list<BM_CrewMgmt__c> crewMgmtList){
+        Integer currentIndex = crewMgmtList.size();
+        BM_CrewMgmt__c crewMgmt;
+        Integer randomIndex;
+        while (0 != currentIndex) {
+            randomIndex = Integer.valueOf(Math.floor(Math.random() * currentIndex));
+            currentIndex -= 1;
+            crewMgmt = crewMgmtList[currentIndex];
+            crewMgmtList[currentIndex] = crewMgmtList[randomIndex];
+            crewMgmtList[randomIndex] = crewMgmt;
+            
+        }
+        return crewMgmtList;
+    }
+
+
+    //일자별 생산성 관리에서 넘겨받은 날짜로 조회하여 해당 날짜의 오전스케줄인원 값 조회
+    // private Integer dailyOpRecommendedCrewCount(String fcID,  Date dPMDate){
+    //     Integer result = 0;
+
+    //     List<BM_DailyProductivityManagement__c> dpmList = [SELECT Id, OP_ScheduledCrews__c
+    //                                             FROM BM_DailyProductivityManagement__c 
+    //                                             WHERE BM_DPM_FC__c = :fcID AND BM_DPM_Date__c = :dPMDate ORDER BY BM_DPM_Date__c ASC LIMIT 1];
+
+
+    //     if(dpmList[0].OP_ScheduledCrews__c == null){
+    //         result = 0;
+    //     }else{
+    //         result = Integer.valueOf(dpmList[0].OP_ScheduledCrews__c);
+    //     }
+
+
+    //     return result;
+    // }
+
+
+
+
+    global void finish(Database.BatchableContext dbc){
+        //if(crewScheduleChk){
+            system.debug('finish');
+            // if (!Test.isRunningTest()){
+            //     BM_44_CL_CrewSchedule batchObj = new BM_44_CL_CrewSchedule();
+            //     batchObj.startDate = startDate;
+            //     batchObj.endDate = endDate;
+            //     Database.executeBatch(batchObj, 30);
+            // }
+        //}
+        
+    }
+
+
+
+}
